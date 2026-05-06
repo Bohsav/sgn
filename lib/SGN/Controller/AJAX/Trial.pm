@@ -1451,117 +1451,148 @@ sub upload_multiple_trial_designs_file_POST : Args(0) {
         return;
     }
     unlink $upload_tempfile;
+ 
+    my @cmd = (
+        'perl',
+        "$basepath/bin/upload_multiple_trial_design.pl",
+        '-H',  $dbhost,
+        '-D',  $dbname,
+        '-U',  $dbuser,
+        '-P',  $dbpass,
+        '-w',  $basepath,
+        '-i',  $archived_filename_with_path,
+        '-un', $username,
+    );
 
-    # Build the backend script command to parse, validate, and upload the trials
-    my $cmd = "perl \"$basepath/bin/upload_multiple_trial_design.pl\" -H \"$dbhost\" -D \"$dbname\" -U \"$dbuser\" -P \"$dbpass\" -w \"$basepath\" -i \"$archived_filename_with_path\" -un \"$username\"";
-    $cmd .= " -e \"$email_address\"" if $email_option_enabled && $email_address && !$test;
-    $cmd .= " -iw" if $ignore_warnings;
-    $cmd .= " -t" if $test;
-    $cmd .= " -sa" if $test;
-    $cmd .= " -r \"$replacements_encoded\"" if $replacements_encoded;
+    push @cmd, ('-e', $email_address) if $email_option_enabled && $email_address && !$test;
+    push @cmd, '-iw' if $ignore_warnings;
+    push @cmd, '-t'  if $test;
+    push @cmd, '-sa' if $test;
+    push @cmd, ('-r', $replacements_encoded) if $replacements_encoded;
 
-    # Run asynchronously if email option is enabled
-    # my $runner = CXGN::Tools::Run->new();
-    my $job = CXGN::Job->new({
-        sp_person_id => $user_id,
-        schema => $c->dbic_schema("Bio::Chado::Schema"),
-        people_schema => $c->dbic_schema("CXGN::People::Schema"),
-        cmd => $cmd,
-        name => "$upload_original_name multiple trial designs upload",
-        results_page => '/breeders/trials',
-        job_type => 'upload',
-        finish_logfile => $c->config->{job_finish_log}
-    });
-    if ( $email_option_enabled && $email_address ) {
-        #$runner->run_async($cmd);
-        $job->submit();
-        #my $err = $runner->err();
-        #my $out = $runner->out();
+    # For now: always run synchronously (prototype behavior)
+    # Capture stdout/stderr to files, then parse stderr like before
+    my $out_file = $archived_filename_with_path . ".out";
+    my $err_file = $archived_filename_with_path . ".err";
 
-        #print STDERR "Upload Trials Output (async):\n";
-        #print STDERR "$err\n";
-        #print STDERR "$out\n";
-
-        $c->stash->{rest} = {background => 1};
+    my $pid = fork();
+    if (!defined $pid) {
+        $c->stash->{rest} = { errors => ["Failed to fork upload process: $!"] };
         return;
     }
 
-    # Otherwise run synchronously
+    if ($pid == 0) {
+        # Child process
+
+        # Open log files first
+        open my $outfh, '>', $out_file or do {
+            print STDERR "ERROR Could not open stdout file $out_file: $!\n";
+            exit 1;
+        };
+
+        open my $errfh, '>', $err_file or do {
+            print STDERR "ERROR Could not open stderr file $err_file: $!\n";
+            exit 1;
+        };
+
+        open STDIN,  '<', '/dev/null' or do {
+            print $errfh "ERROR Could not redirect STDIN: $!\n";
+            exit 1;
+        };
+
+        open STDOUT, '>&', $outfh or do {
+            print $errfh "ERROR Could not redirect STDOUT: $!\n";
+            exit 1;
+        };
+
+        open STDERR, '>&', $errfh or do {
+            print $errfh "ERROR Could not redirect STDERR: $!\n";
+            exit 1;
+        };
+
+        exec @cmd;
+
+        # Only reached if exec fails
+        print STDERR "ERROR Failed to exec upload script: $!\n";
+        exit 127;
+    }
+
+    my $waited = waitpid($pid, 0);
+    if ($waited == -1) {
+        $c->stash->{rest} = { errors => ["waitpid failed for upload process: $!"] };
+        return;
+    }
+
+    my $exit_code = $? >> 8;
+    my $signal    = $? & 127;
+    my $coredump  = $? & 128;
+
+    print STDERR "Upload Trials Output (sync):\n";
+    print STDERR "$err_file\n";
+    print STDERR "$out_file\n";
+
+    open my $err, "<", $err_file or do {
+        $c->stash->{rest} = { errors => ["No error file found: $err_file"] };
+        return;
+    };
+
+    open my $out, "<", $out_file or do {
+        $c->stash->{rest} = { errors => ["No out file found: $out_file"] };
+        return;
+    };
+
+    # Collect errors and warnings from STDERR
+    my @errors;
+    my @warnings;
+    my @accessions; # Accession names for Synonym Search Tool integration
+
+    while (<$err>) {
+        chomp;
+        if ($_ =~ /^ERROR/) {
+            s/^ERROR:? ?//;
+            push @errors, $_;
+        }
+        elsif ($_ =~ /^WARNING/) {
+            s/^WARNING:? ?//;
+            push @warnings, $_;
+        }
+        elsif ($_ =~ /^ACCESSION/) {
+            s/^ACCESSION:? ?//;
+            push @accessions, $_;
+        }
+    }
+
+    # If the script died abnormally and did not emit a tagged ERROR line,
+    # add a generic one so the client still gets something useful.
+    if ($signal) {
+        push @errors, "Upload script died with signal $signal" . ($coredump ? " (core dumped)" : "");
+    }
+    elsif ($exit_code != 0 && !@errors) {
+        push @errors, "Upload script failed with exit code $exit_code";
+    }
+
+    my %rtn;
+
+    if (scalar(@errors) > 0) {
+        $c->stash->{rest} = { errors => \@errors };
+        return;
+    }
+
+    if (scalar(@warnings) > 0) {
+        $c->stash->{rest} = { warnings => \@warnings };
+        return;
+    }
+    elsif ($test) {
+        $rtn{synonym_search_check}  = $synonym_search_check  && $synonym_search_check eq 'on';
+        $rtn{synonym_search_update} = $synonym_search_update && $synonym_search_check eq 'on';
+        $rtn{terms} = \@accessions;
+    }
     else {
-        #$runner->run($cmd.$job->generate_finish_timestamp_cmd());
-        #$job->update_status("submitted");
-        #my $err = $runner->err();
-        #my $out = $runner->out();
-
-        $job->submit();
-
-        while($job->alive()) {
-            sleep(1);
-        }
-
-        my $err_file = $job->cxgn_tools_run_config->{err};
-        my $out_file = $job->cxgn_tools_run_config->{out};
-
-        print STDERR "Upload Trials Output (sync):\n";
-        print STDERR "$err_file\n";
-        print STDERR "$out_file\n";
-
-        open my $err, "<", $err_file or die "No error file found!\n";
-        open my $out, "<", $out_file or die "No out file found!\n";
-
-        # Collect errors and warnings from STDERR
-        my @errors;
-        my @warnings;
-        my @accessions; # Accession Names for the Synonym Search Tool integration
-        while (<$err>) {
-            chomp;
-            if ($_ =~ /^ERROR/) {
-                $_ =~ s/ERROR:? ?//;
-                push @errors, $_;
-            }
-            elsif ($_ =~ /^WARNING/) {
-                $_ =~ s/WARNING:? ?//;
-                push @warnings, $_;
-            }
-            elsif ($_ =~ /^ACCESSION/) {
-                $_ =~ s/ACCESSION:? ?//;
-                push @accessions, $_;
-            }
-        }
-        # foreach (split(/\n/, $err)) {
-        #     if ($_ =~ /^ERROR/) {
-        #         $_ =~ s/ERROR:? ?//;
-        #         push @errors, $_;
-        #     }
-        #     elsif ($_ =~ /^WARNING/) {
-        #         $_ =~ s/WARNING:? ?//;
-        #         push @warnings, $_;
-        #     }
-        # }
-
-        my %rtn;
-        if ( scalar(@errors) > 0 ) {
-            $c->stash->{rest} = {errors => \@errors};
-            $job->update_status("failed");
-            return;
-        }
-        if ( scalar(@warnings) > 0 ) {
-            $c->stash->{rest} = {warnings => \@warnings};
-            $job->update_status("failed");
-            return;
-        }
-        elsif ( $test ) {
-            $rtn{synonym_search_check} = $synonym_search_check && $synonym_search_check eq 'on';
-            $rtn{synonym_search_update} = $synonym_search_update && $synonym_search_check eq 'on';
-            $rtn{terms} = \@accessions;
-        }
-        else {
-            $rtn{success} = 1;
-        }
-        $c->stash->{rest} = \%rtn;
-        return;
+        $rtn{success} = 1;
     }
 
+    $c->stash->{rest} = \%rtn;
+    return;
 }
 
 
